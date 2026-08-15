@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# dshr — launch remote dsh servers and local tunnels, for many machines.
+#
+#   dshr up <ssh-host> [--port N] [--sync]   install (idempotent) + start remote server + tunnel
+#   dshr down <ssh-host> [--server]          stop tunnel (and the remote server with --server)
+#   dshr list                                managed hosts: tunnel + remote server status
+#
+# Machine inventory = your ~/.ssh/config aliases. No separate dshr config.
+# State lives in $DSHR_HOME (default ~/.dsh/remote). The remote server binds
+# its loopback ONLY; access is via the local ssh tunnel — ssh is the auth and
+# crypto layer. The tunnel daemonizes via `ssh -f`, so it survives the shell.
+#
+# Env knobs: DSHR_HOME (~/.dsh/remote), DSHR_DSH_VERSION (0.1.0-rc.6),
+#   DSHR_NODE_MAJOR (22), DSHR_NODE_VERSION (fallback, 22.23.2),
+#   DSHR_REMOTE_PORT (3080), DSHR_LOCAL_PORT_BASE (3081), DSHR_SSH_OPTS (extra ssh options).
+set -euo pipefail
+
+DSHR_HOME="${DSHR_HOME:-$HOME/.dsh/remote}"
+DSH_VERSION="${DSHR_DSH_VERSION:-0.1.0-rc.6}"
+NODE_MAJOR="${DSHR_NODE_MAJOR:-22}"
+NODE_FALLBACK="${DSHR_NODE_VERSION:-22.23.2}"
+REMOTE_PORT="${DSHR_REMOTE_PORT:-3080}"
+LOCAL_PORT_BASE="${DSHR_LOCAL_PORT_BASE:-3081}"
+SESSIONS="$DSHR_HOME/sessions"
+
+mkdir -p "$DSHR_HOME/tunnels"
+touch "$SESSIONS"
+
+usage() { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+say()  { printf '     %s\n' "$*"; }
+die()  { printf 'dshr: %s\n' "$*" >&2; exit 1; }
+
+sshc() { ssh -n ${DSHR_SSH_OPTS:+$DSHR_SSH_OPTS} -o BatchMode=yes -o ConnectTimeout=8 "$@"; }
+scpc() { scp ${DSHR_SSH_OPTS:+$DSHR_SSH_OPTS} -o BatchMode=yes -o ConnectTimeout=8 "$@"; }
+
+state_of()  { awk -v h="$1" '$1==h {print; found=1} END{exit !found}' "$SESSIONS"; }
+drop_state(){ local t; t=$(mktemp); awk -v h="$1" '$1!=h' "$SESSIONS" >"$t" && mv "$t" "$SESSIONS"; }
+port_busy() { lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
+# PIDs of ssh daemons listening on $1 — lsof's own -c filter keeps this
+# ps-free (and fail-closed when the listener is not an ssh process).
+tunnel_pids() {
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN -t -c ssh 2>/dev/null || true
+}
+tunnel_pid() { tunnel_pids "$1" | head -1; }
+
+# dsh's installed version, read from the filesystem — `dsh --version` needs a
+# node startup and reliably prints nothing over non-interactive ssh, which once
+# made "not installed" masquerade as "installed" (empty version, piped exit 0).
+remote_dsh_version() {
+  sshc "$HOST" 'b=$HOME/.local/node/bin/dsh; f=$HOME/.local/node/lib/node_modules/@deepseek-ai/dsh/package.json; if [ -x "$b" ] && [ -f "$f" ]; then sed -n "s/.*\"version\": *\"\([^\"]*\)\".*/\1/p" "$f" | head -1; fi' || true
+}
+
+ensure_install() {
+  local arch A NV DV V
+  arch=$(sshc "$HOST" 'uname -m') || die "cannot probe $HOST"
+  case "$arch" in
+    x86_64)        A=x64   ;;
+    aarch64|arm64) A=arm64 ;;
+    *) die "unsupported remote arch: $arch" ;;
+  esac
+  if NV=$(sshc "$HOST" '$HOME/.local/node/bin/node -v 2>/dev/null'); then
+    say "node ${NV} (existing)"
+  else
+    say "resolving latest node v${NODE_MAJOR}.x from mirrors.aliyun.com"
+    V=$(curl -fsSL --max-time 20 https://mirrors.aliyun.com/nodejs-release/ 2>/dev/null \
+        | grep -o "v${NODE_MAJOR}\.[0-9]*\.[0-9]*" | sort -u | sed 's/^v//' \
+        | awk -F. '{printf "%06d%06d%06d %s\n",$1,$2,$3,$0}' | sort -n | tail -1 | cut -d' ' -f2)
+    V="v${V:-$NODE_FALLBACK}"
+    say "installing node ${V} linux-${A} -> ~/.local/node"
+    sshc "$HOST" "set -e; cd /tmp; curl -sS -f --max-time 300 -O https://mirrors.aliyun.com/nodejs-release/$V/node-$V-linux-$A.tar.gz; rm -rf \$HOME/.local/node; mkdir -p \$HOME/.local; tar -xzf node-$V-linux-$A.tar.gz -C \$HOME/.local && mv \$HOME/.local/node-$V-linux-$A \$HOME/.local/node" \
+      || die "node install failed on $HOST"
+    NV=$(sshc "$HOST" '$HOME/.local/node/bin/node -v') || die "node broken after install on $HOST"
+    say "node ${NV} installed"
+  fi
+  DV=$(remote_dsh_version)
+  if [ -n "$DV" ] && [ "$DV" = "$DSH_VERSION" ]; then
+    say "dsh ${DV} (existing)"
+  else
+    if [ -n "$DV" ]; then say "dsh ${DV} found, pinning ${DSH_VERSION}"; else say "installing @deepseek-ai/dsh@${DSH_VERSION} via npmmirror"; fi
+    sshc "$HOST" "PATH=\$HOME/.local/node/bin:\$PATH npm install -g --registry=https://registry.npmmirror.com @deepseek-ai/dsh@$DSH_VERSION >/tmp/dshr-install.log 2>&1" \
+      || { sshc "$HOST" 'tail -5 /tmp/dshr-install.log' >&2 || true; die "dsh install failed on $HOST"; }
+    DV=$(remote_dsh_version)
+    [ -n "$DV" ] || die "dsh installed but unreadable on $HOST (check /tmp/dshr-install.log)"
+    say "dsh ${DV} installed"
+    DSH_INSTALLED=1
+  fi
+}
+
+ensure_creds() {
+  sshc "$HOST" 'mkdir -p ~/.dsh' >/dev/null
+  local f need
+  for f in .credentials.yaml settings.yaml; do
+    [ -f "$HOME/.dsh/$f" ] || continue
+    need=0
+    if [ "$SYNC" = 1 ]; then need=1
+    elif ! sshc "$HOST" "[ -f \$HOME/.dsh/$f ]" >/dev/null 2>&1; then need=1
+    fi
+    if [ "$need" = 1 ]; then
+      scpc "$HOME/.dsh/$f" "$HOST:.dsh/$f" >/dev/null 2>&1 || die "failed to copy $f"
+      sshc "$HOST" "chmod 600 ~/.dsh/$f" >/dev/null 2>&1 || true
+      say "copied ~/.dsh/$f"
+    fi
+  done
+}
+
+ensure_server() {
+  if sshc "$HOST" 'tmux has-session -t dsh-web 2>/dev/null'; then
+    if [ "${DSH_INSTALLED:-0}" = 1 ]; then
+      say "dsh (re)installed this run — restarting server on the new binary"
+      sshc "$HOST" 'tmux kill-session -t dsh-web 2>/dev/null || true'
+    elif sshc "$HOST" "curl -s --noproxy '*' -o /dev/null --max-time 4 http://127.0.0.1:${REMOTE_PORT}/"; then
+      say "remote server already running (tmux dsh-web)"
+      return
+    else
+      say "remote tmux session exists but server not answering — restarting"
+      sshc "$HOST" 'tmux kill-session -t dsh-web 2>/dev/null || true'
+    fi
+  fi
+  say "starting remote server (tmux dsh-web, loopback :${REMOTE_PORT}, cwd ~/workspace)"
+  sshc "$HOST" "mkdir -p \$HOME/workspace && tmux new-session -d -s dsh-web -c \$HOME/workspace \"PATH=\\\$HOME/.local/node/bin:\\\$PATH dsh web --port ${REMOTE_PORT} 2>&1 | tee /tmp/dsh-web.log\"" \
+    || die "failed to start remote tmux session on $HOST"
+  local i ok=""
+  for i in $(seq 1 20); do
+    if sshc "$HOST" "curl -s --noproxy '*' -o /dev/null --max-time 4 http://127.0.0.1:${REMOTE_PORT}/"; then ok=1; break; fi
+    sleep 1
+  done
+  [ -n "$ok" ] || { sshc "$HOST" 'tail -10 /tmp/dsh-web.log' >&2 || true; die "remote server did not come up"; }
+}
+
+cmd_up() {
+  [ $# -ge 1 ] || usage 1
+  HOST=$1; shift
+  PORT=""; SYNC=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --port) PORT=${2:?}; shift 2 ;;
+      --sync) SYNC=1; shift ;;
+      *) die "unknown arg: $1" ;;
+    esac
+  done
+  echo "▸ ${HOST}"
+  sshc "$HOST" true >/dev/null 2>&1 || die "cannot ssh to $HOST (key auth required — BatchMode)"
+  DSH_INSTALLED=0
+  ensure_install
+  ensure_creds
+  ensure_server
+
+  local ENTRY PID ok i
+  ENTRY=$(state_of "$HOST") || true
+  if [ -n "$ENTRY" ]; then
+    PORT=$(printf '%s\n' "$ENTRY" | awk '{print $2}')
+    if port_busy "$PORT"; then
+      if curl -s --noproxy "*" -o /dev/null --max-time 4 "http://localhost:${PORT}/"; then
+        say "tunnel already up (:${PORT})"
+        echo
+        echo "  ✔ ${HOST}  →  http://localhost:${PORT}"
+        return
+      fi
+      die "local port ${PORT} is held by a non-answering process; free it or: dshr down ${HOST}"
+    fi
+    drop_state "$HOST"
+  fi
+  if [ -z "$PORT" ]; then
+    PORT=$LOCAL_PORT_BASE
+    while port_busy "$PORT"; do PORT=$((PORT+1)); done
+  else
+    port_busy "$PORT" && die "local port ${PORT} is already in use"
+  fi
+  say "opening tunnel :${PORT} → ${HOST}:127.0.0.1:${REMOTE_PORT} (ssh -f)"
+  ssh -f -N -L "${PORT}:127.0.0.1:${REMOTE_PORT}" \
+    -o BatchMode=yes -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
+    ${DSHR_SSH_OPTS:+$DSHR_SSH_OPTS} "$HOST" \
+    || die "tunnel failed (ssh -f)"
+  ok=""
+  for i in $(seq 1 10); do
+    if curl -s --noproxy "*" -o /dev/null --max-time 3 "http://localhost:${PORT}/"; then ok=1; break; fi
+    sleep 1
+  done
+  [ -n "$ok" ] || die "tunnel up but remote GUI not answering on :${PORT}"
+  PID=$(tunnel_pid "$PORT")
+  echo "$HOST $PORT ${PID:-?}" >> "$SESSIONS"
+  echo
+  echo "  ✔ ${HOST}  →  http://localhost:${PORT}"
+  say "remote: tmux session dsh-web (~/workspace, loopback :${REMOTE_PORT}, logs /tmp/dsh-web.log)"
+  say "stop tunnel: dshr down ${HOST}    stop remote too: dshr down ${HOST} --server"
+  say "first visit? open the URL and pick a remote workspace directory in the UI"
+}
+
+cmd_down() {
+  [ $# -ge 1 ] || usage 1
+  HOST=$1; shift
+  SERVER=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --server) SERVER=1; shift ;;
+      *) die "unknown arg: $1" ;;
+    esac
+  done
+  local ENTRY PORT PID RPID
+  ENTRY=$(state_of "$HOST") || true
+  if [ -n "$ENTRY" ]; then
+    PORT=$(printf '%s\n' "$ENTRY" | awk '{print $2}')
+    RPID=$(printf '%s\n' "$ENTRY" | awk '{print $3}')
+    PID=""
+    if [ -n "$RPID" ] && [ "$RPID" != "?" ] && kill -0 "$RPID" 2>/dev/null; then PID="$RPID"; fi
+    local ALL
+    ALL=$(tunnel_pids "$PORT")
+    if [ -n "$PID" ] || [ -n "$ALL" ]; then
+      { [ -n "$PID" ] && kill "$PID" 2>/dev/null; [ -n "$ALL" ] && kill $ALL 2>/dev/null; } || true
+      sleep 0.3
+      if port_busy "$PORT"; then
+        say "WARN :${PORT} still listening after kill; check: lsof -nP -iTCP:${PORT} -sTCP:LISTEN"
+      else
+        say "tunnel stopped (:${PORT})"
+      fi
+    else
+      say "no ssh tunnel identified on :${PORT}; if a listener remains: lsof -nP -iTCP:${PORT} -sTCP:LISTEN"
+    fi
+    drop_state "$HOST"
+  else
+    say "no managed tunnel for ${HOST}"
+  fi
+  if [ "$SERVER" = 1 ]; then
+    sshc "$HOST" 'tmux kill-session -t dsh-web 2>/dev/null || true' || true
+    say "remote server stopped"
+  fi
+}
+
+cmd_list() {
+  printf '%-24s %-8s %-7s %-5s %s\n' HOST LOCALURL TUNNEL HTTP REMOTE
+  local h p tun code srv
+  while read -r h p _pid; do
+    [ -n "$h" ] || continue
+    if port_busy "$p"; then tun=up; else tun=DOWN; fi
+    code=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 3 "http://localhost:${p}/" 2>/dev/null || echo 000)
+    if sshc "$h" 'tmux has-session -t dsh-web 2>/dev/null' </dev/null 2>/dev/null; then srv=up; else srv=down; fi
+    printf '%-24s %-8s %-7s %-5s %s\n' "$h" ":${p}" "$tun" "$code" "$srv"
+  done < "$SESSIONS"
+}
+
+case "${1:-}" in
+  up)   shift; cmd_up "$@" ;;
+  down) shift; cmd_down "$@" ;;
+  list) shift; cmd_list "$@" ;;
+  -h|--help|help|"") usage 0 ;;
+  *) usage 1 ;;
+esac
