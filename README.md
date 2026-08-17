@@ -59,6 +59,8 @@ dshr local down             # stop it
 - Shows up in `dshr list` under the reserved host `@local` (also stoppable via
   `dshr down @local`). State is tracked in the same `$DSHR_HOME/sessions` file.
 - First run downloads the package via npx; later runs are near-instant.
+- Default port 3080 collides with a manually started `dsh web`: on
+  `EADDRINUSE`, stop the old instance (`dshr local down`) or pass `--port N`.
 
 ## Remote dsh CLI
 
@@ -83,6 +85,10 @@ CLI commands):
 dshr dsh localhost plugin --profile web add @some/plugin
 dshr dsh @local --version
 ```
+
+Pass each dsh argument separately — don't wrap the whole command in quotes.
+`dshr dsh` forwards argv verbatim, so a single quoted string arrives at dsh
+as one malformed argument (dsh reports `--profile <name> is required`).
 
 ## Security model
 

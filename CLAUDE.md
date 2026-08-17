@@ -53,3 +53,5 @@ dshr list
 - 头部注释块（2–15 行）是权威的用法/环境变量文档；语义变化时同步更新它和 README.md（用户视角文档）。
 - 默认镜像（Aliyun node 发布 + npmmirror）针对国内网络；替换镜像只改 `ensure_install` 中的 URL。
 - 错误路径必须 `die`（stderr + 非零退出），不要在错误路径静默 `return` 后假装成功。
+- `dshr dsh` 是参数透传：参数逐个传，不要用引号把整条 dsh 命令包成单个参数——dsh 会把含空格的畸形参数报成 `--profile <name> is required`（缺参误报）。
+- 本地 3080 端口冲突：`dshr local` 与手动 `dsh web` 默认端口同为 3080，先起者占住后另一者报 `EADDRINUSE`；dshr 登记的 @local 实例用 `dshr local down` 停。
