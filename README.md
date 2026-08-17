@@ -75,6 +75,15 @@ Runs `dsh <args>` on the remote over SSH using the pinned install in
 not need to be up, and stdin is forwarded, so interactive dsh commands work
 when your terminal allows it.
 
+Use `localhost`, `127.0.0.1`, or `@local` as the host to skip ssh and run the
+same pinned dsh version locally via npx (like `dshr local`, but for one-off
+CLI commands):
+
+```sh
+dshr dsh localhost plugin --profile web add @some/plugin
+dshr dsh @local --version
+```
+
 ## Security model
 
 - The remote server never binds a public interface: SSH is the only path, and it

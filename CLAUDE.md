@@ -14,7 +14,7 @@ shellcheck dshr              # 静态检查（若已安装）
 ln -s "$PWD/dshr/dshr" /usr/local/bin/dshr   # 安装到 PATH
 dshr up <ssh-host> [--port N] [--sync]       # 手动验证（幂等，可重跑）
 dshr down <ssh-host> [--server]
-dshr dsh <ssh-host> <dsh args...>            # 在远程执行 dsh 子命令（退出码透传）
+dshr dsh <ssh-host> <dsh args...>            # 在远程执行 dsh 子命令（localhost/@local 走本地 npx）
 dshr list
 ```
 
@@ -37,6 +37,7 @@ dshr list
 - **健康检查一律 `--noproxy '*'`**（本地与远端两侧），防止本地代理环境干扰 localhost 探测。
 - **隧道必须带 `ExitOnForwardFailure=yes`**（170 行）：端口被占时快速失败而不是静默驻留。
 - **`cmd_dsh` 透传 stdin/tty**：与其它命令不同，实际执行不用 `sshc`（其 `-n` 会把 stdin 指到 /dev/null），而是保留 stdin 的 ssh（仍强制 `BatchMode=yes` + `ConnectTimeout=8`），使远程 dsh 的交互式提示可用；参数经 `printf '%q'` 逐字传给远端 shell，退出码原样透传。不要改回 `sshc`。
+- **`cmd_dsh` 的 localhost 快捷方式**：host 为 `localhost`/`127.0.0.1`/`@local` 时不经 ssh，直接 `npx @deepseek-ai/dsh@$DSH_VERSION` 本地执行（与 `cmd_local_up` 同款 pin 与用法），参数与退出码直接透传。
 - **重装即重启**：`DSH_INSTALLED=1` 由 `ensure_install` 设置，`ensure_server` 据此决定是否重启 tmux 会话；否则会话健康就直接复用。
 
 ## 远程端约定

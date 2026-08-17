@@ -3,7 +3,7 @@
 #
 #   dshr up <ssh-host> [--port N] [--sync]   install (idempotent) + start remote server + tunnel
 #   dshr down <ssh-host> [--server]          stop tunnel (and the remote server with --server)
-#   dshr dsh <ssh-host> <dsh args...>        run a dsh subcommand on the remote (exit code kept)
+#   dshr dsh <ssh-host> <dsh args...>        run a dsh subcommand (localhost/@local = run locally)
 #   dshr local [--port N]                    run a local dsh server via npx (no ssh, cwd = $PWD)
 #   dshr local down                          stop the local server (same as: dshr down @local)
 #   dshr list                                managed hosts: tunnel + remote server status
@@ -239,6 +239,15 @@ cmd_dsh() {
   [ $# -ge 1 ] || usage 1
   HOST=$1; shift
   [ $# -ge 1 ] || die "dshr dsh: missing dsh args (e.g. plugin --profile web add @pkg)"
+  case "$HOST" in
+    localhost|127.0.0.1|@local)
+      # local shortcut: same pinned dsh via npx, no ssh (mirrors dshr local);
+      # args pass through verbatim and npx keeps dsh's exit code.
+      echo "▸ ${HOST}: dsh $*"
+      npx --yes "@deepseek-ai/dsh@${DSH_VERSION}" "$@"
+      return
+      ;;
+  esac
   sshc "$HOST" true >/dev/null 2>&1 || die "cannot ssh to $HOST (key auth required — BatchMode)"
   local DV
   DV=$(remote_dsh_version 2>/dev/null)
