@@ -3,12 +3,16 @@
 #
 #   dshr up <ssh-host> [--port N] [--sync]   install (idempotent) + start remote server + tunnel
 #   dshr down <ssh-host> [--server]          stop tunnel (and the remote server with --server)
+#   dshr local [--port N]                    run a local dsh server via npx (no ssh, cwd = $PWD)
+#   dshr local down                          stop the local server (same as: dshr down @local)
 #   dshr list                                managed hosts: tunnel + remote server status
 #
 # Machine inventory = your ~/.ssh/config aliases. No separate dshr config.
 # State lives in $DSHR_HOME (default ~/.dsh/remote). The remote server binds
 # its loopback ONLY; access is via the local ssh tunnel — ssh is the auth and
 # crypto layer. The tunnel daemonizes via `ssh -f`, so it survives the shell.
+# `local` runs the same pinned dsh version on this machine via npx, logs to
+# /tmp/dshr-local.log; its state line uses the reserved host @local.
 #
 # Env knobs: DSHR_HOME (~/.dsh/remote), DSHR_DSH_VERSION (0.1.0-rc.6),
 #   DSHR_NODE_MAJOR (22), DSHR_NODE_VERSION (fallback, 22.23.2),
@@ -25,8 +29,7 @@ SESSIONS="$DSHR_HOME/sessions"
 
 mkdir -p "$DSHR_HOME/tunnels"
 touch "$SESSIONS"
-
-usage() { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 say()  { printf '     %s\n' "$*"; }
 die()  { printf 'dshr: %s\n' "$*" >&2; exit 1; }
 
@@ -190,6 +193,7 @@ cmd_up() {
 cmd_down() {
   [ $# -ge 1 ] || usage 1
   HOST=$1; shift
+  if [ "$HOST" = "@local" ]; then cmd_local_down "$@"; return; fi
   SERVER=0
   while [ $# -gt 0 ]; do
     case $1 in
@@ -227,11 +231,82 @@ cmd_down() {
   fi
 }
 
+cmd_local_up() {
+  local PORT="$REMOTE_PORT"
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --port) PORT=${2:?}; shift 2 ;;
+      *) die "unknown arg: $1" ;;
+    esac
+  done
+  echo "▸ @local"
+  local ENTRY PID ok
+  ENTRY=$(state_of "@local") || true
+  if [ -n "$ENTRY" ]; then
+    PORT=$(printf '%s\n' "$ENTRY" | awk '{print $2}')
+    if port_busy "$PORT"; then
+      if curl -s --noproxy "*" -o /dev/null --max-time 4 "http://localhost:${PORT}/"; then
+        say "local server already up (:${PORT})"
+        echo
+        echo "  ✔ @local  →  http://localhost:${PORT}"
+        return
+      fi
+      die "local port ${PORT} is held by a non-answering process; free it or: dshr local down"
+    fi
+    drop_state "@local"
+  fi
+  port_busy "$PORT" && die "local port ${PORT} is already in use"
+  say "starting local dsh via npx (web :${PORT}, cwd $PWD, logs /tmp/dshr-local.log)"
+  nohup npx --yes "@deepseek-ai/dsh@${DSH_VERSION}" web --port "$PORT" \
+    </dev/null >/tmp/dshr-local.log 2>&1 &
+  PID=$!
+  for _ in $(seq 1 30); do
+    if curl -s --noproxy "*" -o /dev/null --max-time 3 "http://localhost:${PORT}/"; then ok=1; break; fi
+    kill -0 "$PID" 2>/dev/null || break
+    sleep 1
+  done
+  [ -n "$ok" ] || { kill "$PID" 2>/dev/null || true; tail -10 /tmp/dshr-local.log >&2 || true; die "local server did not come up (see /tmp/dshr-local.log)"; }
+  echo
+  echo "  ✔ @local  →  http://localhost:${PORT}"
+  say "cwd: $PWD   logs: /tmp/dshr-local.log"
+  echo "@local $PORT $PID" >> "$SESSIONS"
+}
+
+cmd_local_down() {
+  local ENTRY PORT PID
+  ENTRY=$(state_of "@local") || true
+  if [ -z "$ENTRY" ]; then
+    say "no managed local server"
+    return
+  fi
+  PORT=$(printf '%s\n' "$ENTRY" | awk '{print $2}')
+  PID=$(printf '%s\n' "$ENTRY" | awk '{print $3}')
+  local LISTENERS
+  LISTENERS=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null || true)
+  if [ -n "$PID" ] && [ "$PID" != "?" ] && kill -0 "$PID" 2>/dev/null; then
+    kill "$PID" 2>/dev/null || true
+  fi
+  # shellcheck disable=SC2086 # multiple listener PIDs, intentional word-split
+  if [ -n "$LISTENERS" ]; then kill $LISTENERS 2>/dev/null || true; fi
+  if port_busy "$PORT"; then
+    say "WARN :${PORT} still listening after kill; check: lsof -nP -iTCP:${PORT} -sTCP:LISTEN"
+  else
+    say "local server stopped (:${PORT})"
+  fi
+  drop_state "@local"
+}
+
 cmd_list() {
   printf '%-24s %-8s %-7s %-5s %s\n' HOST LOCALURL TUNNEL HTTP REMOTE
   local h p tun code srv
   while read -r h p _pid; do
     [ -n "$h" ] || continue
+    if [ "$h" = "@local" ]; then
+      if port_busy "$p"; then tun=up; else tun=DOWN; fi
+      code=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 3 "http://localhost:${p}/" 2>/dev/null || echo 000)
+      printf '%-24s %-8s %-7s %-5s %s\n' "@local" ":${p}" "$tun" "$code" local
+      continue
+    fi
     if port_busy "$p"; then tun=up; else tun=DOWN; fi
     code=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 3 "http://localhost:${p}/" 2>/dev/null || echo 000)
     if sshc "$h" 'tmux has-session -t dsh-web 2>/dev/null' </dev/null 2>/dev/null; then srv=up; else srv=down; fi
@@ -242,6 +317,10 @@ cmd_list() {
 case "${1:-}" in
   up)   shift; cmd_up "$@" ;;
   down) shift; cmd_down "$@" ;;
+  local) shift; case "${1:-}" in
+           down) shift; cmd_local_down "$@" ;;
+           *)    cmd_local_up "$@" ;;
+         esac ;;
   list) shift; cmd_list "$@" ;;
   -h|--help|help|"") usage 0 ;;
   *) usage 1 ;;

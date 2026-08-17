@@ -7,8 +7,10 @@ remote DSH development server, and wires up the local tunnel to reach it:
 
 ```sh
 dshr up my-server          # install (idempotent) + start remote server + open tunnel
+dshr local                 # run a local DSH server via npx (no ssh, cwd = $PWD)
 dshr list                  # every managed host: tunnel / HTTP / remote status
 dshr down my-server        # stop the tunnel (add --server to stop the remote too)
+dshr local down            # stop the local server
 ```
 
 Open the printed URL (`http://localhost:308x`) and you get the full DSH WebUI —
@@ -38,9 +40,24 @@ history) is natively remote. No plugins, no extra protocol.
 4. **Tunnel** — `ssh -f -N -L <local>:127.0.0.1:3080` (daemonized, keepalive).
    Local ports are auto-allocated from `3081` up, so many hosts can be up at once;
    `--port` pins one.
-
 Machine inventory is your existing `~/.ssh/config` — there is no separate `dshr`
 configuration. State lives in `~/.dsh/remote/`.
+
+## Local mode
+
+No remote machine handy? `dshr local` runs the same pinned dsh version on this
+machine, straight from the npx cache — no install step, no ssh:
+
+```sh
+dshr local [--port N]       # start (idempotent); default port 3080
+dshr local down             # stop it
+```
+
+- Workspace/cwd is your current directory; logs go to `/tmp/dshr-local.log`.
+- The server still binds loopback only, so the security model is unchanged.
+- Shows up in `dshr list` under the reserved host `@local` (also stoppable via
+  `dshr down @local`). State is tracked in the same `$DSHR_HOME/sessions` file.
+- First run downloads the package via npx; later runs are near-instant.
 
 ## Security model
 
@@ -66,9 +83,9 @@ Supports Linux x86_64 / arm64 remotes.
 | Variable | Default | Meaning |
 |---|---|---|
 | `DSHR_HOME` | `~/.dsh/remote` | State directory (host/port registry) |
-| `DSHR_DSH_VERSION` | `0.1.0-rc.6` | Remote dsh version pin; changing it upgrades and restarts the remote server on next `up` |
+| `DSHR_DSH_VERSION` | `0.1.0-rc.6` | dsh version pin (remote install + `dshr local` npx package); changing it upgrades and restarts the remote server on next `up` |
 | `DSHR_NODE_MAJOR` / `DSHR_NODE_VERSION` | `22` / `22.23.2` | Node major version / fallback when the mirror index is unreachable |
-| `DSHR_REMOTE_PORT` | `3080` | Remote server port |
+| `DSHR_REMOTE_PORT` | `3080` | Remote server port; also the default port for `dshr local` |
 | `DSHR_LOCAL_PORT_BASE` | `3081` | Local port allocation base |
 | `DSHR_SSH_OPTS` | — | Extra ssh/scp options (e.g. `-J jump-host`) |
 
