@@ -39,7 +39,7 @@ dshr list
 
 ## 远程端约定
 
-- Node 装到 `~/.local/node`（用户态，无 root）；dsh 经 npm 全局安装，版本由 `DSHR_DSH_VERSION` 固定（默认走 npmmirror registry）。
+- Node 装到 `~/.local/node`（用户态，无 root）；dsh 经 npm 全局安装，版本由 `DSHR_DSH_VERSION` 固定（默认走 npmmirror registry）。安装必须带 `--prefix $HOME/.local/node`：远端 `~/.npmrc` 若自定义了 prefix（如 `~/.local`），npm 会把包装到别处，导致按 `~/.local/node` 读磁盘的 `remote_dsh_version` 误报"未安装/不可读"。不要去掉该 flag。
 - 远程服务器运行在 tmux 会话 `dsh-web`：cwd `~/workspace`，loopback `:3080`，日志 `/tmp/dsh-web.log`（排障先 `tail /tmp/dsh-web.log`）。
 - 凭据 `~/.dsh/.credentials.yaml` / `settings.yaml` 仅在远程缺失时复制（`--sync` 强制覆盖），权限 0600。
 - 本地端口从 `DSHR_LOCAL_PORT_BASE`（3081）向上自动分配，`lsof -nP -iTCP:<port> -sTCP:LISTEN` 判断占用。

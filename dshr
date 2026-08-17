@@ -80,7 +80,10 @@ ensure_install() {
     say "dsh ${DV} (existing)"
   else
     if [ -n "$DV" ]; then say "dsh ${DV} found, pinning ${DSH_VERSION}"; else say "installing @deepseek-ai/dsh@${DSH_VERSION} via npmmirror"; fi
-    sshc "$HOST" "PATH=\$HOME/.local/node/bin:\$PATH npm install -g --registry=https://registry.npmmirror.com @deepseek-ai/dsh@$DSH_VERSION >/tmp/dshr-install.log 2>&1" \
+    # --prefix pins the install to ~/.local/node even when the remote
+    # ~/.npmrc sets a different global prefix; remote_dsh_version reads
+    # package.json from that exact location.
+    sshc "$HOST" "PATH=\$HOME/.local/node/bin:\$PATH npm install -g --prefix \$HOME/.local/node --registry=https://registry.npmmirror.com @deepseek-ai/dsh@$DSH_VERSION >/tmp/dshr-install.log 2>&1" \
       || { sshc "$HOST" 'tail -5 /tmp/dshr-install.log' >&2 || true; die "dsh install failed on $HOST"; }
     DV=$(remote_dsh_version)
     [ -n "$DV" ] || die "dsh installed but unreadable on $HOST (check /tmp/dshr-install.log)"
