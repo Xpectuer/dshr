@@ -7,6 +7,7 @@ remote DSH development server, and wires up the local tunnel to reach it:
 
 ```sh
 dshr up my-server          # install (idempotent) + start remote server + open tunnel
+dshr dsh my-server plugin --profile web add @some/plugin   # run a dsh CLI command on the remote
 dshr local                 # run a local DSH server via npx (no ssh, cwd = $PWD)
 dshr list                  # every managed host: tunnel / HTTP / remote status
 dshr down my-server        # stop the tunnel (add --server to stop the remote too)
@@ -58,6 +59,21 @@ dshr local down             # stop it
 - Shows up in `dshr list` under the reserved host `@local` (also stoppable via
   `dshr down @local`). State is tracked in the same `$DSHR_HOME/sessions` file.
 - First run downloads the package via npx; later runs are near-instant.
+
+## Remote dsh CLI
+
+Need to run a `dsh` command on a remote machine — install a plugin, manage
+profiles or sessions — without entering the WebUI?
+
+```sh
+dshr dsh my-server plugin --profile web add @some/plugin
+dshr dsh my-server --version
+```
+
+Runs `dsh <args>` on the remote over SSH using the pinned install in
+`~/.local/node`; dsh's output and exit code pass through. The web server does
+not need to be up, and stdin is forwarded, so interactive dsh commands work
+when your terminal allows it.
 
 ## Security model
 

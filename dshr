@@ -3,6 +3,7 @@
 #
 #   dshr up <ssh-host> [--port N] [--sync]   install (idempotent) + start remote server + tunnel
 #   dshr down <ssh-host> [--server]          stop tunnel (and the remote server with --server)
+#   dshr dsh <ssh-host> <dsh args...>        run a dsh subcommand on the remote (exit code kept)
 #   dshr local [--port N]                    run a local dsh server via npx (no ssh, cwd = $PWD)
 #   dshr local down                          stop the local server (same as: dshr down @local)
 #   dshr list                                managed hosts: tunnel + remote server status
@@ -29,7 +30,7 @@ SESSIONS="$DSHR_HOME/sessions"
 
 mkdir -p "$DSHR_HOME/tunnels"
 touch "$SESSIONS"
-usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 say()  { printf '     %s\n' "$*"; }
 die()  { printf 'dshr: %s\n' "$*" >&2; exit 1; }
 
@@ -234,6 +235,23 @@ cmd_down() {
   fi
 }
 
+cmd_dsh() {
+  [ $# -ge 1 ] || usage 1
+  HOST=$1; shift
+  [ $# -ge 1 ] || die "dshr dsh: missing dsh args (e.g. plugin --profile web add @pkg)"
+  sshc "$HOST" true >/dev/null 2>&1 || die "cannot ssh to $HOST (key auth required — BatchMode)"
+  local DV
+  DV=$(remote_dsh_version 2>/dev/null)
+  [ -n "$DV" ] || die "dsh not installed on $HOST (run: dshr up $HOST)"
+  echo "▸ ${HOST}: dsh $*"
+  # Unlike sshc (which forces stdin to /dev/null), keep stdin + tty so dsh
+  # prompts and interactive commands work; BatchMode + key auth still enforced.
+  # printf '%q' quotes each arg so the remote shell sees them verbatim; the
+  # last ssh is the function's last command, so its exit code (dsh's own) is kept.
+  ssh -o BatchMode=yes -o ConnectTimeout=8 ${DSHR_SSH_OPTS:+$DSHR_SSH_OPTS} \
+    "$HOST" "PATH=\$HOME/.local/node/bin:\$PATH dsh $(printf '%q ' "$@")"
+}
+
 cmd_local_up() {
   local PORT="$REMOTE_PORT"
   while [ $# -gt 0 ]; do
@@ -324,6 +342,7 @@ case "${1:-}" in
            down) shift; cmd_local_down "$@" ;;
            *)    cmd_local_up "$@" ;;
          esac ;;
+  dsh)   shift; cmd_dsh "$@" ;;
   list) shift; cmd_list "$@" ;;
   -h|--help|help|"") usage 0 ;;
   *) usage 1 ;;

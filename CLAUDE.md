@@ -14,6 +14,7 @@ shellcheck dshr              # 静态检查（若已安装）
 ln -s "$PWD/dshr/dshr" /usr/local/bin/dshr   # 安装到 PATH
 dshr up <ssh-host> [--port N] [--sync]       # 手动验证（幂等，可重跑）
 dshr down <ssh-host> [--server]
+dshr dsh <ssh-host> <dsh args...>            # 在远程执行 dsh 子命令（退出码透传）
 dshr list
 ```
 
@@ -26,7 +27,7 @@ dshr list
 1. **全局配置**（18–27 行）：所有环境变量默认值在此展开（`DSHR_HOME`、`DSHR_DSH_VERSION`、`DSHR_NODE_MAJOR`、`DSHR_NODE_VERSION`、`DSHR_REMOTE_PORT`、`DSHR_LOCAL_PORT_BASE`、`DSHR_SSH_OPTS`）。新增环境 knob 时沿用 `${DSHR_X:-default}` 模式，并在头部注释块（2–15 行）登记。
 2. **辅助函数**（29–44 行）：输出约定（进度走 stdout 的 `say`，错误走 stderr 的 `die`）、`sshc`/`scpc`（强制 `BatchMode=yes` + `ConnectTimeout=8`，即只支持密钥认证）、awk 状态读写、lsof 端口检测。
 3. **阶段函数**（46–128 行）：`ensure_install` → `ensure_creds` → `ensure_server`，均幂等，`up` 按此顺序执行。
-4. **命令函数**（130–240 行）：`cmd_up`/`cmd_down`/`cmd_list`，末尾 case 分发（242–248 行）。新增子命令时在 case 中登记。
+4. **命令函数**（137–336 行）：`cmd_up`/`cmd_down`/`cmd_dsh`/`cmd_local_up`/`cmd_local_down`/`cmd_list`，末尾 case 分发（338–348 行）。新增子命令时在 case 中登记。
 
 ## 关键设计决策（修改时务必保持）
 
@@ -35,6 +36,7 @@ dshr list
 - **版本检测读磁盘、不读进程**：`remote_dsh_version` 解析远程 package.json（49–51 行注释解释了原因：非交互 ssh 下 `dsh --version` 的 node 启动无输出，曾导致"未安装"被误判为"已安装"）。不要改回进程调用。
 - **健康检查一律 `--noproxy '*'`**（本地与远端两侧），防止本地代理环境干扰 localhost 探测。
 - **隧道必须带 `ExitOnForwardFailure=yes`**（170 行）：端口被占时快速失败而不是静默驻留。
+- **`cmd_dsh` 透传 stdin/tty**：与其它命令不同，实际执行不用 `sshc`（其 `-n` 会把 stdin 指到 /dev/null），而是保留 stdin 的 ssh（仍强制 `BatchMode=yes` + `ConnectTimeout=8`），使远程 dsh 的交互式提示可用；参数经 `printf '%q'` 逐字传给远端 shell，退出码原样透传。不要改回 `sshc`。
 - **重装即重启**：`DSH_INSTALLED=1` 由 `ensure_install` 设置，`ensure_server` 据此决定是否重启 tmux 会话；否则会话健康就直接复用。
 
 ## 远程端约定
