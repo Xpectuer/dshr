@@ -14,7 +14,7 @@ shellcheck dshr              # 静态检查（若已安装）
 ln -s "$PWD/dshr/dshr" /usr/local/bin/dshr   # 安装到 PATH
 dshr up <ssh-host> [--port N] [--sync]       # 手动验证（幂等，可重跑）
 dshr down <ssh-host> [--server]
-dshr dsh <ssh-host> <dsh args...>            # 在远程执行 dsh 子命令（localhost/@local 走本地 npx）
+dshr dsh <ssh-host> <dsh args...>            # 在远程执行 dsh 子命令（localhost/@local 走本地 prefix）
 dshr list
 ```
 
@@ -24,7 +24,7 @@ dshr list
 
 脚本是扁平单文件结构，按顺序组织：
 
-1. **全局配置**（18–27 行）：所有环境变量默认值在此展开（`DSHR_HOME`、`DSHR_DSH_VERSION`、`DSHR_NODE_MAJOR`、`DSHR_NODE_VERSION`、`DSHR_REMOTE_PORT`、`DSHR_LOCAL_PORT_BASE`、`DSHR_SSH_OPTS`）。新增环境 knob 时沿用 `${DSHR_X:-default}` 模式，并在头部注释块（2–15 行）登记。
+1. **全局配置**（18–27 行）：所有环境变量默认值在此展开（`DSHR_HOME`、`DSHR_DSH_VERSION`、`DSHR_NODE_MAJOR`、`DSHR_NODE_VERSION`、`DSHR_REMOTE_PORT`、`DSHR_LOCAL_PORT_BASE`、`DSHR_LOCAL_PREFIX`、`DSHR_SSH_OPTS`）。新增环境 knob 时沿用 `${DSHR_X:-default}` 模式，并在头部注释块（2–15 行）登记。
 2. **辅助函数**（29–44 行）：输出约定（进度走 stdout 的 `say`，错误走 stderr 的 `die`）、`sshc`/`scpc`（强制 `BatchMode=yes` + `ConnectTimeout=8`，即只支持密钥认证）、awk 状态读写、lsof 端口检测。
 3. **阶段函数**（46–128 行）：`ensure_install` → `ensure_creds` → `ensure_server`，均幂等，`up` 按此顺序执行。
 4. **命令函数**（137–336 行）：`cmd_up`/`cmd_down`/`cmd_dsh`/`cmd_local_up`/`cmd_local_down`/`cmd_list`，末尾 case 分发（338–348 行）。新增子命令时在 case 中登记。
@@ -37,12 +37,14 @@ dshr list
 - **健康检查一律 `--noproxy '*'`**（本地与远端两侧），防止本地代理环境干扰 localhost 探测。
 - **隧道必须带 `ExitOnForwardFailure=yes`**（170 行）：端口被占时快速失败而不是静默驻留。
 - **`cmd_dsh` 透传 stdin/tty**：与其它命令不同，实际执行不用 `sshc`（其 `-n` 会把 stdin 指到 /dev/null），而是保留 stdin 的 ssh（仍强制 `BatchMode=yes` + `ConnectTimeout=8`），使远程 dsh 的交互式提示可用；参数经 `printf '%q'` 逐字传给远端 shell，退出码原样透传。不要改回 `sshc`。
-- **`cmd_dsh` 的 localhost 快捷方式**：host 为 `localhost`/`127.0.0.1`/`@local` 时不经 ssh，直接 `npx @deepseek-ai/dsh@$DSH_VERSION` 本地执行（与 `cmd_local_up` 同款 pin 与用法），参数与退出码直接透传。
+- **`cmd_dsh` 的 localhost 快捷方式**：host 为 `localhost`/`127.0.0.1`/`@local` 时不经 ssh，直接从本地 prefix 执行同款 pin 的 dsh（`ensure_local_dsh` + `"$LOCAL_PREFIX/node_modules/.bin/dsh"`），参数与退出码直接透传。
+- **本地安装镜像远程模型，不用 npx**：`ensure_local_dsh` 把目标版本装进 `~/.local/dsh`（`npm install --prefix` + npmmirror），版本从 package.json 读磁盘校验（`local_dsh_version`）。npm ≥ 11 必须带 `--install-strategy=nested --foreground-scripts`：npm 11+ 的 arborist 在 dsh 依赖图的 hoisted 放置上死锁（placeDep 停在 dsh-sandbox-policy 后），nested 可完成；`--foreground-scripts` 恢复 11.18 前的安装脚本行为。安装同样清代理 env。运行时要求 node ≥ 22.6（`check_local_node` 预检，zstd/withResolvers/stripTypeScriptTypes 是 22.6+ API）。不要改回 npx——其缓存 key 随 npm 版本变化，且 npm 11+ 下必死锁。
+- **默认跟随最新版**：`resolve_dsh_version` 在未设 `DSHR_DSH_VERSION` 时查 npmmirror 的 `dist-tags.latest`（清代理、`--fetch-retries 1 --fetch-timeout 30000` 快速失败，失败提示用户钉版本）；`ensure_install`/`ensure_local_dsh` 拿解析结果与磁盘版本比对，不一致即升级。本地服务器运行中升级会先杀旧进程再启新进程（同 `up` 的"重装即重启"，`LOCAL_DSH_INSTALLED` 标记）。
 - **重装即重启**：`DSH_INSTALLED=1` 由 `ensure_install` 设置，`ensure_server` 据此决定是否重启 tmux 会话；否则会话健康就直接复用。
 
 ## 远程端约定
 
-- Node 装到 `~/.local/node`（用户态，无 root）；dsh 经 npm 全局安装，版本由 `DSHR_DSH_VERSION` 固定（默认走 npmmirror registry）。安装必须带 `--prefix $HOME/.local/node`：远端 `~/.npmrc` 若自定义了 prefix（如 `~/.local`），npm 会把包装到别处，导致按 `~/.local/node` 读磁盘的 `remote_dsh_version` 误报"未安装/不可读"。不要去掉该 flag。
+- Node 装到 `~/.local/node`（用户态，无 root）；dsh 经 npm 全局安装，默认取 npmmirror 最新版，`DSHR_DSH_VERSION` 可钉住版本。安装必须带 `--prefix $HOME/.local/node`：远端 `~/.npmrc` 若自定义了 prefix（如 `~/.local`），npm 会把包装到别处，导致按 `~/.local/node` 读磁盘的 `remote_dsh_version` 误报"未安装/不可读"。不要去掉该 flag。
 - 远程服务器运行在 tmux 会话 `dsh-web`：cwd `~/workspace`，loopback `:3080`，日志 `/tmp/dsh-web.log`（排障先 `tail /tmp/dsh-web.log`）。
 - 凭据 `~/.dsh/.credentials.yaml` / `settings.yaml` 仅在远程缺失时复制（`--sync` 强制覆盖），权限 0600。
 - 本地端口从 `DSHR_LOCAL_PORT_BASE`（3081）向上自动分配，`lsof -nP -iTCP:<port> -sTCP:LISTEN` 判断占用。

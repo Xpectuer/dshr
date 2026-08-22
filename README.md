@@ -30,7 +30,8 @@ history) is natively remote. No plugins, no extra protocol.
 ## What `up` does (all idempotent — re-run anytime)
 
 1. **Install** — user-space Node.js (LTS) to `~/.local/node` from a release mirror
-   (no root needed), then `@deepseek-ai/dsh` pinned to `$DSHR_DSH_VERSION`.
+   (no root needed), then `@deepseek-ai/dsh` at the latest npmmirror release
+   (`$DSHR_DSH_VERSION` pins a specific version).
    Version detection reads `package.json` from disk — reliable over
    non-interactive SSH.
 2. **Credentials** — copies local `~/.dsh/.credentials.yaml` / `settings.yaml`
@@ -47,18 +48,24 @@ configuration. State lives in `~/.dsh/remote/`.
 ## Local mode
 
 No remote machine handy? `dshr local` runs the same pinned dsh version on this
-machine, straight from the npx cache — no install step, no ssh:
+machine — no ssh:
 
 ```sh
 dshr local [--port N]       # start (idempotent); default port 3080
 dshr local down             # stop it
 ```
 
+- dsh is installed into `~/.local/dsh` via `npm install --prefix` (the same
+  user-space model as the remote `~/.local/node`), at the latest npmmirror
+  release by default (`$DSHR_DSH_VERSION` pins a version); the install is
+  idempotent and version-checked from `package.json` on disk. When a newer
+  dsh appears, `dshr local` upgrades and restarts the server.
 - Workspace/cwd is your current directory; logs go to `/tmp/dshr-local.log`.
 - The server still binds loopback only, so the security model is unchanged.
 - Shows up in `dshr list` under the reserved host `@local` (also stoppable via
   `dshr down @local`). State is tracked in the same `$DSHR_HOME/sessions` file.
-- First run downloads the package via npx; later runs are near-instant.
+- First run downloads the package tree (~250 packages); later runs are
+  near-instant. dsh needs node >= 22.6 at runtime.
 - Default port 3080 collides with a manually started `dsh web`: on
   `EADDRINUSE`, stop the old instance (`dshr local down`) or pass `--port N`.
 
@@ -78,8 +85,8 @@ not need to be up, and stdin is forwarded, so interactive dsh commands work
 when your terminal allows it.
 
 Use `localhost`, `127.0.0.1`, or `@local` as the host to skip ssh and run the
-same pinned dsh version locally via npx (like `dshr local`, but for one-off
-CLI commands):
+same dsh version as `dshr local` from the local prefix (one-off CLI
+commands):
 
 ```sh
 dshr dsh localhost plugin --profile web add @some/plugin
@@ -114,10 +121,11 @@ Supports Linux x86_64 / arm64 remotes.
 | Variable | Default | Meaning |
 |---|---|---|
 | `DSHR_HOME` | `~/.dsh/remote` | State directory (host/port registry) |
-| `DSHR_DSH_VERSION` | `0.1.0-rc.6` | dsh version pin (remote install + `dshr local` npx package); changing it upgrades and restarts the remote server on next `up` |
+| `DSHR_DSH_VERSION` | *(latest)* | dsh version for remote install + `dshr local`; empty = latest on npmmirror, set to pin; changing it upgrades and restarts the remote server on next `up` |
 | `DSHR_NODE_MAJOR` / `DSHR_NODE_VERSION` | `22` / `22.23.2` | Node major version / fallback when the mirror index is unreachable |
 | `DSHR_REMOTE_PORT` | `3080` | Remote server port; also the default port for `dshr local` |
 | `DSHR_LOCAL_PORT_BASE` | `3081` | Local port allocation base |
+| `DSHR_LOCAL_PREFIX` | `~/.local/dsh` | Local dsh install prefix (`dshr local` / `dshr dsh @local`) |
 | `DSHR_SSH_OPTS` | — | Extra ssh/scp options (e.g. `-J jump-host`) |
 
 ## Notes
@@ -127,6 +135,14 @@ Supports Linux x86_64 / arm64 remotes.
   Plain `npm` / nodejs.org work fine elsewhere if you edit the two URLs.
 - Health probes always use `curl --noproxy '*'` so local proxy environments
   can't interfere with localhost checks.
+- The `dshr local` / `dshr dsh @local` npm install runs with proxy env vars
+  cleared for the same reason: a stale `http_proxy`/`https_proxy` pointing at
+  a dead proxy hangs npm's registry fetch indefinitely.
+- npm >= 11 deadlocks on dsh's dependency graph under the default hoisted
+  install strategy; dshr switches to `--install-strategy=nested` there (npm
+  10 needs no flag). Runtime needs node >= 22.6.
+- dshr tracks the latest dsh release by default (checked against npmmirror
+  on each `up` / `local`); `DSHR_DSH_VERSION` freezes a version.
 - Tunnels don't auto-restore after a local reboot — just `dshr up <host>` again
   (idempotent, takes seconds).
 - If the browser ever shows "Failed to load plugins" (e.g. the tunnel blinked

@@ -4,7 +4,7 @@
 #   dshr up <ssh-host> [--port N] [--sync]   install (idempotent) + start remote server + tunnel
 #   dshr down <ssh-host> [--server]          stop tunnel (and the remote server with --server)
 #   dshr dsh <ssh-host> <dsh args...>        run a dsh subcommand (localhost/@local = run locally)
-#   dshr local [--port N]                    run a local dsh server via npx (no ssh, cwd = $PWD)
+#   dshr local [--port N]                    run a local dsh server (no ssh, cwd = $PWD)
 #   dshr local down                          stop the local server (same as: dshr down @local)
 #   dshr list                                managed hosts: tunnel + remote server status
 #
@@ -12,20 +12,23 @@
 # State lives in $DSHR_HOME (default ~/.dsh/remote). The remote server binds
 # its loopback ONLY; access is via the local ssh tunnel — ssh is the auth and
 # crypto layer. The tunnel daemonizes via `ssh -f`, so it survives the shell.
-# `local` runs the same pinned dsh version on this machine via npx, logs to
+# `local` runs the same pinned dsh version from ~/.local/dsh — installed via
+# `npm --prefix` (same model as the remote ~/.local/node), logs to
 # /tmp/dshr-local.log; its state line uses the reserved host @local.
 #
-# Env knobs: DSHR_HOME (~/.dsh/remote), DSHR_DSH_VERSION (0.1.0-rc.6),
-#   DSHR_NODE_MAJOR (22), DSHR_NODE_VERSION (fallback, 22.23.2),
-#   DSHR_REMOTE_PORT (3080), DSHR_LOCAL_PORT_BASE (3081), DSHR_SSH_OPTS (extra ssh options).
+# Env knobs: DSHR_HOME (~/.dsh/remote), DSHR_DSH_VERSION (default: latest
+#   on npmmirror; set to pin a version), DSHR_NODE_MAJOR (22),
+#   DSHR_NODE_VERSION (fallback, 22.23.2), DSHR_REMOTE_PORT (3080),
+#   DSHR_LOCAL_PORT_BASE (3081), DSHR_LOCAL_PREFIX (~/.local/dsh),
+#   DSHR_SSH_OPTS (extra ssh options).
 set -euo pipefail
 
 DSHR_HOME="${DSHR_HOME:-$HOME/.dsh/remote}"
-DSH_VERSION="${DSHR_DSH_VERSION:-0.1.0-rc.6}"
 NODE_MAJOR="${DSHR_NODE_MAJOR:-22}"
 NODE_FALLBACK="${DSHR_NODE_VERSION:-22.23.2}"
 REMOTE_PORT="${DSHR_REMOTE_PORT:-3080}"
 LOCAL_PORT_BASE="${DSHR_LOCAL_PORT_BASE:-3081}"
+LOCAL_PREFIX="${DSHR_LOCAL_PREFIX:-$HOME/.local/dsh}"
 SESSIONS="$DSHR_HOME/sessions"
 
 mkdir -p "$DSHR_HOME/tunnels"
@@ -47,6 +50,77 @@ tunnel_pids() {
 }
 tunnel_pid() { tunnel_pids "$1" | head -1; }
 
+# dsh's installed version in the local prefix, read from the filesystem —
+# same reasoning as remote_dsh_version (avoid a node startup for the probe).
+local_dsh_version() {
+  local f="$LOCAL_PREFIX/node_modules/@deepseek-ai/dsh/package.json"
+  if [ -f "$f" ]; then sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$f" | head -1; fi
+}
+
+# dsh 0.1.x needs node >= 22.6 (zstd in node:zlib, Promise.withResolvers,
+# node:module stripTypeScriptTypes); fail fast with the real requirement
+# instead of a cryptic plugin-tree crash at startup.
+check_local_node() {
+  local NV MAJ MIN
+  NV=$(node --version 2>/dev/null | sed 's/^v//') || die "node not found on PATH"
+  MAJ=${NV%%.*}; MIN=${NV#*.}; MIN=${MIN%%.*}
+  if [ "$MAJ" -lt 22 ] || { [ "$MAJ" -eq 22 ] && [ "$MIN" -lt 6 ]; }; then
+    die "dsh requires node >= 22.6 (have ${NV}); switch with nvm"
+  fi
+}
+
+ensure_local_dsh() {
+  local DV VERSION NPMMA FLAGS=()
+  DV=$(local_dsh_version)
+  VERSION=$(resolve_dsh_version)
+  if [ -n "$DV" ] && [ "$DV" = "$VERSION" ]; then
+    say "dsh ${DV} (up to date)"
+    return
+  fi
+  if [ -n "$DV" ]; then
+    if [ -n "${DSHR_DSH_VERSION:-}" ]; then say "dsh ${DV} found, pinning ${VERSION}"; else say "dsh ${DV} installed, updating to ${VERSION} (latest)"; fi
+  else
+    say "installing @deepseek-ai/dsh@${VERSION} via npmmirror"
+  fi
+  # npm >= 11 deadlocks (arborist peer-dep placement) on dsh's dependency
+  # graph under the default hoisted strategy; nested placement completes.
+  # --foreground-scripts restores the pre-11.18 install-script behavior.
+  NPMMA=$(npm --version 2>/dev/null | awk -F. '{print $1}') || die "npm not found on PATH"
+  if [ -n "$NPMMA" ] && [ "$NPMMA" -ge 11 ]; then
+    FLAGS=(--install-strategy=nested --foreground-scripts)
+  fi
+  # The install runs proxy-free: a stale http_proxy/https_proxy pointing at a
+  # dead proxy hangs npm's registry fetch — same policy as --noproxy '*'.
+  env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+    -u all_proxy -u ALL_PROXY \
+    npm install --prefix "$LOCAL_PREFIX" \
+    --registry=https://registry.npmmirror.com --no-audit --no-fund \
+    "${FLAGS[@]}" "@deepseek-ai/dsh@${VERSION}" >/tmp/dshr-local-install.log 2>&1 \
+    || { tail -5 /tmp/dshr-local-install.log >&2 || true; die "local dsh install failed (see /tmp/dshr-local-install.log)"; }
+  LOCAL_DSH_INSTALLED=1
+  DV=$(local_dsh_version)
+  [ -n "$DV" ] || die "dsh installed but unreadable at $LOCAL_PREFIX"
+  say "dsh ${DV} installed"
+}
+
+# The dsh version to install: the user's pin when DSHR_DSH_VERSION is set,
+# otherwise the registry's dist-tags.latest. Only install paths resolve this
+# (network); list/down never do. Fails fast with a hint instead of hanging.
+resolve_dsh_version() {
+  local V
+  if [ -n "${DSHR_DSH_VERSION:-}" ]; then
+    printf '%s\n' "$DSHR_DSH_VERSION"
+    return
+  fi
+  V=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+    -u all_proxy -u ALL_PROXY \
+    npm view @deepseek-ai/dsh dist-tags.latest \
+    --registry=https://registry.npmmirror.com --fetch-retries 1 --fetch-timeout 30000 \
+    2>/dev/null | tail -1) || die "cannot resolve latest dsh version; set DSHR_DSH_VERSION to pin one"
+  [ -n "$V" ] || die "cannot resolve latest dsh version (empty response); set DSHR_DSH_VERSION to pin one"
+  printf '%s\n' "$V"
+}
+
 # dsh's installed version, read from the filesystem — `dsh --version` needs a
 # node startup and reliably prints nothing over non-interactive ssh, which once
 # made "not installed" masquerade as "installed" (empty version, piped exit 0).
@@ -55,7 +129,7 @@ remote_dsh_version() {
 }
 
 ensure_install() {
-  local arch A NV DV V
+  local arch A NV DV V VERSION
   arch=$(sshc "$HOST" 'uname -m') || die "cannot probe $HOST"
   case "$arch" in
     x86_64)        A=x64   ;;
@@ -77,14 +151,19 @@ ensure_install() {
     say "node ${NV} installed"
   fi
   DV=$(remote_dsh_version)
-  if [ -n "$DV" ] && [ "$DV" = "$DSH_VERSION" ]; then
-    say "dsh ${DV} (existing)"
+  VERSION=$(resolve_dsh_version)
+  if [ -n "$DV" ] && [ "$DV" = "$VERSION" ]; then
+    say "dsh ${DV} (up to date)"
   else
-    if [ -n "$DV" ]; then say "dsh ${DV} found, pinning ${DSH_VERSION}"; else say "installing @deepseek-ai/dsh@${DSH_VERSION} via npmmirror"; fi
+    if [ -n "$DV" ]; then
+      if [ -n "${DSHR_DSH_VERSION:-}" ]; then say "dsh ${DV} found, pinning ${VERSION}"; else say "dsh ${DV} installed, updating to ${VERSION} (latest)"; fi
+    else
+      say "installing @deepseek-ai/dsh@${VERSION} via npmmirror"
+    fi
     # --prefix pins the install to ~/.local/node even when the remote
     # ~/.npmrc sets a different global prefix; remote_dsh_version reads
     # package.json from that exact location.
-    sshc "$HOST" "PATH=\$HOME/.local/node/bin:\$PATH npm install -g --prefix \$HOME/.local/node --registry=https://registry.npmmirror.com @deepseek-ai/dsh@$DSH_VERSION >/tmp/dshr-install.log 2>&1" \
+    sshc "$HOST" "PATH=\$HOME/.local/node/bin:\$PATH npm install -g --prefix \$HOME/.local/node --registry=https://registry.npmmirror.com @deepseek-ai/dsh@$VERSION >/tmp/dshr-install.log 2>&1" \
       || { sshc "$HOST" 'tail -5 /tmp/dshr-install.log' >&2 || true; die "dsh install failed on $HOST"; }
     DV=$(remote_dsh_version)
     [ -n "$DV" ] || die "dsh installed but unreadable on $HOST (check /tmp/dshr-install.log)"
@@ -241,10 +320,13 @@ cmd_dsh() {
   [ $# -ge 1 ] || die "dshr dsh: missing dsh args (e.g. plugin --profile web add @pkg)"
   case "$HOST" in
     localhost|127.0.0.1|@local)
-      # local shortcut: same pinned dsh via npx, no ssh (mirrors dshr local);
-      # args pass through verbatim and npx keeps dsh's exit code.
+      # local shortcut: same pinned dsh from the local prefix, no ssh
+      # (mirrors dshr local); args pass through verbatim and the exec keeps
+      # dsh's exit code.
       echo "▸ ${HOST}: dsh $*"
-      npx --yes "@deepseek-ai/dsh@${DSH_VERSION}" "$@"
+      check_local_node
+      ensure_local_dsh
+      "$LOCAL_PREFIX/node_modules/.bin/dsh" "$@"
       return
       ;;
   esac
@@ -270,9 +352,12 @@ cmd_local_up() {
     esac
   done
   echo "▸ @local"
+  check_local_node
+  LOCAL_DSH_INSTALLED=0
+  ensure_local_dsh
   local ENTRY PID ok
   ENTRY=$(state_of "@local") || true
-  if [ -n "$ENTRY" ]; then
+  if [ -n "$ENTRY" ] && [ "$LOCAL_DSH_INSTALLED" = 0 ]; then
     PORT=$(printf '%s\n' "$ENTRY" | awk '{print $2}')
     if port_busy "$PORT"; then
       if curl -s --noproxy "*" -o /dev/null --max-time 4 "http://localhost:${PORT}/"; then
@@ -284,13 +369,24 @@ cmd_local_up() {
       die "local port ${PORT} is held by a non-answering process; free it or: dshr local down"
     fi
     drop_state "@local"
+  elif [ -n "$ENTRY" ]; then
+    # a newer dsh was installed while a server was running — restart it on
+    # the new binary (same reinstall-implies-restart rule as `dshr up`)
+    PORT=$(printf '%s\n' "$ENTRY" | awk '{print $2}')
+    say "dsh upgraded — restarting local server on the new version"
+    PID=$(printf '%s\n' "$ENTRY" | awk '{print $3}')
+    [ -n "$PID" ] && [ "$PID" != "?" ] && kill "$PID" 2>/dev/null || true
+    sleep 0.3
+    drop_state "@local"
   fi
   port_busy "$PORT" && die "local port ${PORT} is already in use"
-  say "starting local dsh via npx (web :${PORT}, cwd $PWD, logs /tmp/dshr-local.log)"
-  nohup npx --yes "@deepseek-ai/dsh@${DSH_VERSION}" web --port "$PORT" \
+  say "starting local dsh (web :${PORT}, cwd $PWD, logs /tmp/dshr-local.log)"
+  nohup "$LOCAL_PREFIX/node_modules/.bin/dsh" web --port "$PORT" \
     </dev/null >/tmp/dshr-local.log 2>&1 &
   PID=$!
-  for _ in $(seq 1 30); do
+  # dsh boots in a few seconds; the generous cap tolerates slow machines,
+  # and the process-death break below still fails fast when dsh crashes.
+  for _ in $(seq 1 600); do
     if curl -s --noproxy "*" -o /dev/null --max-time 3 "http://localhost:${PORT}/"; then ok=1; break; fi
     kill -0 "$PID" 2>/dev/null || break
     sleep 1
